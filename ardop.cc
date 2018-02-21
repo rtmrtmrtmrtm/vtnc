@@ -65,10 +65,10 @@ public:
 class Leader : public Source {
 private:
   double _hz; // nominally 1500 Hz
-  long long _seq ; // next sample number to generate
+  long long _off ; // next sample number to generate
 
 public:
-  Leader(double hz) : _seq(0), _hz(hz) { }
+  Leader(double hz) : _off(0), _hz(hz) { }
 
   int rate() { return RATE; }
 
@@ -83,17 +83,17 @@ public:
   double one() {
     int baud = 50;
     int baudlen = rate() / baud;
-    double phase = (_seq / (rate() / _hz)) * 2 * PI;
+    double phase = (_off / (rate() / _hz)) * 2 * PI;
 
     // invert phase every symbol.
-    phase += PI * ((_seq / baudlen) % 2);
+    phase += PI * ((_off / baudlen) % 2);
 
-    // but not the 11th symbol -- so as to produce the "sync" symbol.
-    if((_seq / baudlen) == 11)
+    // but not the 12th symbol -- so as to produce the "sync" symbol.
+    if((_off / baudlen) == 11)
       phase += PI;
 
     // shape pulse with sinc window
-    double x = PI * (((_seq % baudlen) - (baudlen / 2.0)) / (baudlen / 2.0)); // -pi .. pi
+    double x = PI * (((_off % baudlen) - (baudlen / 2.0)) / (baudlen / 2.0)); // -pi .. pi
     double ampl;
     if(x == 0.0){
       ampl = 1.0;
@@ -103,7 +103,7 @@ public:
     
     double y = cos(phase) * ampl;
 
-    _seq++;
+    _off++;
     return y;
   }
 };
@@ -196,10 +196,11 @@ private:
   std::vector<std::vector<complex> > _window;
   int _wi;
 
-  long long _seq; // seen this many samples
+  long long _off; // next sample # to expect
+  int _ignore; // ignore initial samples
   
 public:
-  FindLeader() : _seq(0) {
+  FindLeader(int ignore) : _off(0), _ignore(ignore) {
     reset();
   }
   ~FindLeader() {
@@ -220,8 +221,12 @@ public:
         digest();
         _buf.resize(0);
       }
-      _buf.push_back(a[i]);
-      _seq++;
+      if(_ignore > 0){
+        _ignore -= 1;
+      } else {
+        _buf.push_back(a[i]);
+      }
+      _off++;
     }
   }
 
@@ -237,9 +242,11 @@ public:
     _wi = (_wi + 1) % _window.size();
   }
 
-  void analyze() {
-    double best_score = 0.0; // higher is better
-    double best_hz = -1;
+  // best_off will be the start of the symbol after the sync symbol.
+  bool analyze(double &best_hz, double &best_score, long long &best_off) {
+    best_score = 0.0; // higher is better
+    best_hz = -1;
+    best_off = -1;
     for(int bin = 0; bin < 3; bin++){
       double mag[8];
       double diff[8];
@@ -267,21 +274,38 @@ public:
       double hzoff = ((rate / (2 * PI)) / symbol_samples) * RATE;
 
       double score = 0.0;
-      double d0 = twopi(diff[0] - rate);
-      if(d0 < 0.3 || d0 > 2*PI-0.3){
-        // XXX 0.3 is arbitrary.
+      double d_adj = twopi(diff[0] - rate);
+      if(d_adj < 0.3 || d_adj > 2*PI-0.3){
         // most recent symbol looks like a sync (no phase inversion).
+        // XXX 0.3 is arbitrary.
+
+        // calculate score from phase inversion of symbols
+        // before sync.
+        bool ok = true;
         for(int i = 1; i < 8; i++){
-          score += mag[i] * (PI - abs(diff[i] - PI));
+          double d_adj = twopi(diff[i] - rate);
+          score += mag[i] * (PI - abs(d_adj - PI));
+          if(abs(d_adj - PI) > 0.3){
+            // XXX 0.3 is arbitrary.
+            ok = false;
+          }
+        }
+        if(ok == false){
+          score = 0.0;
         }
       }
 
-      if(best_hz < 0 || score > best_score){
+      if(score > 0.0 && (best_hz < 0 || score > best_score)){
         best_score = score;
         best_hz = 1500 - 50 + (50 * bin) + hzoff;
+        best_off = _off - _buf.size();
       }
     }
-    printf("%lld best: %.1f %.1f\n", _seq, best_hz, best_score);
+    if(best_score > 0.0){
+      return true;
+    } else {
+      return false;
+    }
   }
 };
 
@@ -298,14 +322,18 @@ int
 main(int argc, char *argv[])
 {
   //Source *w = Wav::open("ardop1.wav");
-  Source *w = new Leader(1500 + 41);
+  Source *w = new Leader(1500 + 0);
   assert(w);
   assert(w->rate() == RATE);
-  Source *bu = new BlockUp(w, RATE / 50);
+  int quarter = (RATE / 50) / 4;
+  Source *bu = new BlockUp(w, quarter);
 
-  // XXX maybe two of four of these, for different symbol alignments
-  // in time.
-  FindLeader *fl = new FindLeader();
+  FindLeader *fl[4];
+  {
+    for(int i = 0; i < 4; i++){
+      fl[i] = new FindLeader(i*quarter);
+    }
+  }
 
   double aa[512];
 
@@ -316,16 +344,27 @@ main(int argc, char *argv[])
     //exit(0);
     if(v.size() < 1)
       break;
-    fl->got(v);
+    for(int i = 0; i < 4; i++){
+      fl[i]->got(v);
+    }
     total += v.size();
     // XXX need to call analyze() every symbol or quarter symbol.
     if(total >= 8*(RATE/50)){
-      fl->analyze();
+      for(int i = 0; i < 4; i++){
+        double xhz;
+        double xscore;
+        long long xoff;
+        bool ok = fl[i]->analyze(xhz, xscore, xoff);
+        if(ok){
+          printf("%d %lld best: %.1f %.1f\n", i, xoff, xhz, xscore);
+        }
+      }
     }
   }
 
   delete bu;
-  delete fl;
+  for(int i = 0; i < 4; i++)
+    delete fl[i];
   delete w;
   
   return 0;
