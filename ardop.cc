@@ -173,6 +173,17 @@ magnitude(complex c)
   return sqrt(c.imag()*c.imag() + c.real()*c.real());
 }
 
+// normalize to 0..2pi
+double
+twopi(double x)
+{
+  while(x < 0.0)
+    x += 2*PI;
+  while(x > 2*PI)
+    x -= 2*PI;
+  return x;
+}
+
 // look for a plausible leader.
 // XXX perhaps create one FindLeader per quarter symbol time.
 class FindLeader {
@@ -230,40 +241,44 @@ public:
     double best_score = 0.0; // higher is better
     double best_hz = -1;
     for(int bin = 0; bin < 3; bin++){
-      double score = 0.0;
-      // the most recent symbol is _wi - 1
-      for(int i = -7; i <= 0; i++){
-        int i0 = (_wi + i - 2 + _window.size()) % _window.size();
-        int i1 = (_wi + i - 1 + _window.size()) % _window.size();
+      double mag[8];
+      double diff[8];
+      // most recent symbol (candidate sync) in ph[0] &c.
+      // _wi-1 is the most recent symbol.
+      for(int i = 0; i < 8; i++){
+        int i0 = (_wi - 2 - i + _window.size()) % _window.size(); // previous
+        int i1 = (_wi - 1 - i + _window.size()) % _window.size(); // this one
         complex c0 = _window[i0][bin]; // previous
         complex c1 = _window[i1][bin]; // this one
         double ph0 = phase(c0);
         double ph1 = phase(c1);
-        double diff = ph1 - ph0;
-        while(diff < 0.0)
-          diff += 2*PI;
-        while(diff > 2*PI)
-          diff -= 2*PI;
-        double mag = magnitude(c1);
-        double absdiff;
-        if(i == 0){
-          // expecting same phase as previous symbol.
-          absdiff = abs(diff); // lower is better
-          if(absdiff < 0.3 || absdiff > (2*PI)-0.3){
-            // pass
-          } else {
-            score = 0;
-          }
-        } else {
-          // expecting opposite phase from previous symbol.
-          absdiff = abs(diff - PI); // lower is better
-          absdiff = PI - absdiff; // higher is better
-          score += absdiff * mag;
+        diff[i] = twopi(ph1 - ph0);
+        mag[i] = magnitude(c1);
+      }
+
+      // guess the frequency offset from the center of the FFT bin,
+      // based on rate of phase change.
+      double rate = 0.0;
+      for(int i = 1; i < 8; i++){
+        // diff[i] should be PI.
+        rate += diff[i] - PI;
+      }
+      rate /= 7.0;
+      double hzoff = ((rate / (2 * PI)) / symbol_samples) * RATE;
+
+      double score = 0.0;
+      double d0 = twopi(diff[0] - rate);
+      if(d0 < 0.3 || d0 > 2*PI-0.3){
+        // XXX 0.3 is arbitrary.
+        // most recent symbol looks like a sync (no phase inversion).
+        for(int i = 1; i < 8; i++){
+          score += mag[i] * (PI - abs(diff[i] - PI));
         }
       }
+
       if(best_hz < 0 || score > best_score){
         best_score = score;
-        best_hz = 1500 - 50 + (50 * bin);
+        best_hz = 1500 - 50 + (50 * bin) + hzoff;
       }
     }
     printf("%lld best: %.1f %.1f\n", _seq, best_hz, best_score);
@@ -283,7 +298,7 @@ int
 main(int argc, char *argv[])
 {
   //Source *w = Wav::open("ardop1.wav");
-  Source *w = new Leader(1500 + 10);
+  Source *w = new Leader(1500 + 41);
   assert(w);
   assert(w->rate() == RATE);
   Source *bu = new BlockUp(w, RATE / 50);
