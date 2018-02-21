@@ -126,6 +126,8 @@ public:
         return v;
       }
       std::vector<double> v = _src->read();
+      if(v.size() == 0)
+        return std::vector<double>();
       _buf.insert(_buf.end(), v.begin(), v.end());
     }
   }
@@ -242,25 +244,29 @@ public:
           diff += 2*PI;
         while(diff > 2*PI)
           diff -= 2*PI;
+        double mag = magnitude(c1);
         double absdiff;
         if(i == 0){
           // expecting same phase as previous symbol.
           absdiff = abs(diff); // lower is better
+          if(absdiff < 0.3 || absdiff > (2*PI)-0.3){
+            // pass
+          } else {
+            score = 0;
+          }
         } else {
           // expecting opposite phase from previous symbol.
           absdiff = abs(diff - PI); // lower is better
           absdiff = PI - absdiff; // higher is better
+          score += absdiff * mag;
         }
-        double mag = magnitude(c1);
-        score += absdiff * mag;
       }
-      // XXX what about final non-reversed phase?
       if(best_hz < 0 || score > best_score){
         best_score = score;
         best_hz = 1500 - 50 + (50 * bin);
       }
     }
-    printf("best: %.1f %.1f\n", best_hz, best_score);
+    printf("%lld best: %.1f %.1f\n", _seq, best_hz, best_score);
   }
 };
 
@@ -276,8 +282,8 @@ writetxt(std::vector<double> v, const char *filename)
 int
 main(int argc, char *argv[])
 {
-  // Source *w = Wav::open("ardop1.wav");
-  Source *w = new Leader(1500 + 0);
+  //Source *w = Wav::open("ardop1.wav");
+  Source *w = new Leader(1500 + 10);
   assert(w);
   assert(w->rate() == RATE);
   Source *bu = new BlockUp(w, RATE / 50);
