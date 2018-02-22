@@ -133,6 +133,41 @@ public:
   }
 };
 
+// cache the last "window" samples.
+class WindowSource : public Source {
+private:
+  int _window; // buffer a window of this many samples in the past.
+  std::vector<double> _buf;
+  long long _off; // first sample beyond _buf.
+  Source *_src;
+
+public:
+  WindowSource(Source *src, int window) : _src(src), _window(window), _off(0) { }
+  ~WindowSource() { }
+  int rate() { return _src->rate(); }
+  std::vector<double> read() {
+    std::vector<double> v = _src->read();
+    _buf.insert(_buf.end(), v.begin(), v.end());
+    if(_buf.size() > _window){
+      int n = _buf.size() - _window;
+      _buf.erase(_buf.begin(), _buf.begin() + n);
+    }
+    _off += v.size();
+    return v;
+  }
+  std::vector<double> readat(long long off, int n) {
+    while(_off < off + n){
+      read();
+    }
+    long long i0 = off - (_off - _buf.size());
+    long long i1 = i0 + n;
+    assert(i0 >= 0);
+    assert(i1 <= _buf.size());
+    std::vector<double> v(_buf.begin() + i0, _buf.begin() + i1);
+    return v;
+  }
+};
+
 // fft of one 50-baud symbol at 12000 samples/second.
 // caller allocates and frees in and out.
 // in[240]
@@ -161,6 +196,19 @@ fft(std::vector<double> in)
   return out;
 }
 
+class FFTCache {
+private:
+  WindowSource *_src;
+
+public:
+  FFTCache(WindowSource *src) : _src(src) { }
+  ~FFTCache() { }
+
+  std::vector<complex> fft(long long off, int n) {
+    return ::fft(_src->readat(off, n));
+  }
+};
+
 double
 phase(complex c)
 {
@@ -185,82 +233,36 @@ twopi(double x)
 }
 
 // look for a plausible leader.
-// XXX perhaps create one FindLeader per quarter symbol time.
 class FindLeader {
 private:
   static const int baud = 50;
   static const int symbol_samples = RATE / baud;
   static const int fft_size = (symbol_samples / 1) + 1;
-  std::vector<double> _buf; // accumulate one symbol's samples
-
-  std::vector<std::vector<complex> > _window;
-  int _wi;
-
-  long long _off; // next sample # to expect
-  int _ignore; // ignore initial samples
+  FFTCache *_fft;
   
 public:
-  FindLeader(int ignore) : _off(0), _ignore(ignore) {
-    reset();
-  }
-  ~FindLeader() {
-  }
+  FindLeader(FFTCache *fft) : _fft(fft) { }
+  ~FindLeader() { }
 
-  void reset() {
-    _window.resize(0);
-    _window.resize(10);
-    for(int i = 0; i < _window.size(); i++)
-      _window[i].resize(3);
-    _buf.resize(0);
-    _wi = 0;
-  }
-  
-  void got(std::vector<double> a) {
-    for(int i = 0; i < a.size(); i++){
-      if(_buf.size() >= symbol_samples){
-        digest();
-        _buf.resize(0);
-      }
-      if(_ignore > 0){
-        _ignore -= 1;
-      } else {
-        _buf.push_back(a[i]);
-      }
-      _off++;
-    }
-  }
-
-  // called once per symbol time.
-  void digest() {
-    assert(_buf.size() == symbol_samples);
-    std::vector<complex> trum = fft(_buf);
-
-    int center_bin = 1500 / baud;
-    for(int bin = 0; bin < 3; bin++){
-      _window[_wi][bin] = trum[center_bin-1+bin];
-    }
-    _wi = (_wi + 1) % _window.size();
-  }
-
-  // best_off will be the start of the symbol after the sync symbol.
-  bool analyze(double &best_hz, double &best_score, long long &best_off) {
+  // off is the start of a putative sync symbol (at end of leader).
+  bool analyze(long long off, double &best_hz, double &best_score) {
+    if(off < symbol_samples*8)
+      return false;
+    
     best_score = 0.0; // higher is better
     best_hz = -1;
-    best_off = -1;
-    for(int bin = 0; bin < 3; bin++){
+    int center_bin = 1500 / baud;
+    for(int bin = center_bin-1; bin <= center_bin+1; bin++){
       double mag[8];
       double diff[8];
-      // most recent symbol (candidate sync) in ph[0] &c.
-      // _wi-1 is the most recent symbol.
+      // i=0 is sync symbol, i=1 is one before that, &c.
       for(int i = 0; i < 8; i++){
-        int i0 = (_wi - 2 - i + _window.size()) % _window.size(); // previous
-        int i1 = (_wi - 1 - i + _window.size()) % _window.size(); // this one
-        complex c0 = _window[i0][bin]; // previous
-        complex c1 = _window[i1][bin]; // this one
-        double ph0 = phase(c0);
-        double ph1 = phase(c1);
-        diff[i] = twopi(ph1 - ph0);
-        mag[i] = magnitude(c1);
+        std::vector<complex> prev = _fft->fft(off - (i+1)*symbol_samples, symbol_samples);
+        std::vector<complex> me = _fft->fft(off - i*symbol_samples, symbol_samples);
+        double prev_ph = phase(prev[bin]);
+        double me_ph = phase(me[bin]);
+        diff[i] = twopi(me_ph - prev_ph);
+        mag[i] = magnitude(me[bin]);
       }
 
       // guess the frequency offset from the center of the FFT bin,
@@ -297,8 +299,7 @@ public:
 
       if(score > 0.0 && (best_hz < 0 || score > best_score)){
         best_score = score;
-        best_hz = 1500 - 50 + (50 * bin) + hzoff;
-        best_off = _off - _buf.size();
+        best_hz = (baud * bin) + hzoff;
       }
     }
     if(best_score > 0.0){
@@ -325,46 +326,23 @@ main(int argc, char *argv[])
   Source *w = new Leader(1500 + 0);
   assert(w);
   assert(w->rate() == RATE);
-  int quarter = (RATE / 50) / 4;
-  Source *bu = new BlockUp(w, quarter);
+  WindowSource *ws = new WindowSource(w, 10 * 240);
+  FFTCache *fftc = new FFTCache(ws);
 
-  FindLeader *fl[4];
-  {
-    for(int i = 0; i < 4; i++){
-      fl[i] = new FindLeader(i*quarter);
+  FindLeader *fl = new FindLeader(fftc);
+
+  for(long long off = 0; ; off += 240/4) {
+    double xhz;
+    double xscore;
+    bool ok = fl->analyze(off, xhz, xscore);
+    if(ok){
+      printf("%lld best: %.1f %.1f\n", off, xhz, xscore);
     }
   }
 
-  double aa[512];
-
-  long long total = 0;
-  while(1){
-    std::vector<double> v = bu->read();
-    //writetxt(v, "x");
-    //exit(0);
-    if(v.size() < 1)
-      break;
-    for(int i = 0; i < 4; i++){
-      fl[i]->got(v);
-    }
-    total += v.size();
-    // XXX need to call analyze() every symbol or quarter symbol.
-    if(total >= 8*(RATE/50)){
-      for(int i = 0; i < 4; i++){
-        double xhz;
-        double xscore;
-        long long xoff;
-        bool ok = fl[i]->analyze(xhz, xscore, xoff);
-        if(ok){
-          printf("%d %lld best: %.1f %.1f\n", i, xoff, xhz, xscore);
-        }
-      }
-    }
-  }
-
-  delete bu;
-  for(int i = 0; i < 4; i++)
-    delete fl[i];
+  delete fl;
+  delete fftc;
+  delete ws;
   delete w;
   
   return 0;
