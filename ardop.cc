@@ -319,31 +319,118 @@ writetxt(std::vector<double> v, const char *filename)
   fclose(fp);
 }
 
-int
-main(int argc, char *argv[])
-{
-  //Source *w = Wav::open("ardop1.wav");
-  Source *w = new Leader(1500 + 0);
-  assert(w);
-  assert(w->rate() == RATE);
-  WindowSource *ws = new WindowSource(w, 10 * 240);
-  FFTCache *fftc = new FFTCache(ws);
+class Decoder {
+private:
+  Source *_src;
+  WindowSource *_ws;
+  FFTCache *_fftc;
+  FindLeader *_fl;
 
-  FindLeader *fl = new FindLeader(fftc);
+public:
+  Decoder() : _src(0), _ws(0), _fftc(0), _fl(0) { }
+  ~Decoder() {
+    if(_src)
+      delete _src;
+    if(_ws)
+      delete _ws;
+    if(_fftc)
+      delete _fftc;
+    if(_fl)
+      delete _fl;
+  }
 
-  for(long long off = 0; ; off += 240/4) {
-    double xhz;
-    double xscore;
-    bool ok = fl->analyze(off, xhz, xscore);
-    if(ok){
-      printf("%lld best: %.1f %.1f\n", off, xhz, xscore);
+  void go() {
+    _src = Wav::open("ardop1.wav");
+    // _src = new Leader(1500 + 0);
+    assert(_src->rate() == RATE);
+    _ws = new WindowSource(_src, 10 * 240 + 512);
+    _fftc = new FFTCache(_ws);
+    _fl = new FindLeader(_fftc);
+
+    int quarter = 240 / 4;
+    for(long long off = 0; ; off += quarter) {
+      double hz, score;
+      bool ok = _fl->analyze(off, hz, score);
+      if(ok){
+        double next_hz, next_score;
+        bool next_ok = _fl->analyze(off + quarter, next_hz, next_score);
+        if(next_ok == false || score > next_score){
+          // this is it!
+          //printf("%lld best: %.1f %.1f\n", off, hz, score);
+          int type;
+          off = decode_type(off + 240, hz, type);
+          if(type >= 0x31 && type < 0x38){
+            // CONREQxxx: 14 bytes of payload
+            std::vector<int> bytes = decode_4fsk(off, hz, 14*4);
+            printf("payload: ");
+            for(int i = 0; i < bytes.size(); i++){
+              printf("%02x ", bytes[i]);
+            }
+            printf("\n");
+          }
+        }
+      }
     }
   }
 
-  delete fl;
-  delete fftc;
-  delete ws;
-  delete w;
-  
-  return 0;
+  // 10 50-baud 4FSK symbols.
+  // 8 bits type, 8 bits type^sessionID, 2 symbols of parity.
+  // off is where we start.
+  // hz is nominally 1500.
+  // tones are 1425, 1475, 1525, and 1575.
+  // so we can't directly use 240-point FFT.
+  long long decode_type(long long off, double hz, int &type) {
+    std::vector<int> bytes = decode_4fsk(off, hz, 10);
+    type = bytes[0];
+    printf("%lld: type %02x\n", off, type);
+    return off + 10*240;
+  }
+
+  // decode the payload of a 4fsk 50 baud packet, e.g. a CONREQxxx.
+  // we expect n_symbols total.
+  // returns an array of decoded bytes.
+  std::vector<int> decode_4fsk(long long off, double hz, int n_symbols) {
+    int symbols[n_symbols];
+    for(int i = 0; i < n_symbols; i++){
+      std::vector<double> v = _ws->readat(off, 240);
+      v.insert(v.begin(), 120, 0.0);
+      v.insert(v.end(), 120, 0.0);
+      std::vector<complex> ff = fft(v); // 480-point fft, so 25-hz bins
+      int maxsym = -1;
+      double maxmag = 0;
+      int sym = 0;
+      for(int bin = 1425/25; bin <= 1575/25; bin += 2){
+        double mag = magnitude(ff[bin]) + magnitude(ff[bin+1]); // 50 hz bin
+        if(maxsym < 0 || mag > maxmag){
+          maxsym = sym;
+          maxmag = mag;
+        }
+        sym++;
+      }
+      symbols[i] = maxsym;
+      off += 240;
+    }
+
+    // no convert 2-bit symbols to bytes.
+    // most-significant symbol first.
+    std::vector<int> bytes;
+    int i = 0;
+    while(i < n_symbols){
+      int x = 0;
+      for(int j = 0; j < 4 && i < n_symbols; j++){
+        x |= symbols[i] << (6 - (j*2));
+        i++;
+      }
+      bytes.push_back(x);
+    }
+
+    return bytes;
+  }
+};
+
+int
+main()
+{
+  Decoder d;
+  d.go();
 }
